@@ -1169,18 +1169,37 @@ class VAE:
         return model_management.intermediate_dtype()
 
     def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap = 16):
+        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).to(dtype=self.vae_output_dtype())
+
+        # Already-small latents (USDU/FaceDetailer crops, etc.) must not go through
+        # the 3-pass skinny tiler: 32-wide strips can silently return NaN/zeros on ROCm.
+        if samples.shape[-2] <= tile_y + overlap and samples.shape[-1] <= tile_x + overlap:
+            try:
+                return self.process_output(decode_fn(samples).to(self.output_device, copy=True))
+            except Exception as e:
+                model_management.raise_non_oom(e)
+
         steps = samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x, tile_y, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
         pbar = comfy.utils.ProgressBar(steps)
 
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).to(dtype=self.vae_output_dtype())
-        output = self.process_output(
-            (comfy.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device, pbar = pbar) +
+        output = (
+            comfy.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device, pbar = pbar) +
             comfy.utils.tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device, pbar = pbar) +
-             comfy.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device, pbar = pbar))
-            / 3.0)
-        return output
+             comfy.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device, pbar = pbar)
+            ) / 3.0
+        if not torch.isfinite(output).all():
+            logging.warning("Tiled VAE decode produced non-finite values, retrying with a single pass")
+            output = comfy.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device)
+            if not torch.isfinite(output).all():
+                logging.warning("Tiled VAE decode still non-finite, falling back to regular decode")
+                try:
+                    output = decode_fn(samples).to(self.output_device, copy=True)
+                except Exception as e:
+                    model_management.raise_non_oom(e)
+                    output = torch.nan_to_num(output)
+        return self.process_output(output)
 
     def decode_tiled_1d(self, samples, tile_x=256, overlap=32):
         if samples.ndim == 3:
@@ -1201,16 +1220,30 @@ class VAE:
         return self.process_output(out.to(device=self.output_device, dtype=self.vae_output_dtype(), copy=True))
 
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
+        encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).to(dtype=self.vae_output_dtype())
+
+        if pixel_samples.shape[-2] <= tile_y + overlap and pixel_samples.shape[-1] <= tile_x + overlap:
+            try:
+                return encode_fn(pixel_samples).to(self.output_device, copy=True)
+            except Exception as e:
+                model_management.raise_non_oom(e)
+
         steps = pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x, tile_y, overlap)
         steps += pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x * 2, tile_y // 2, overlap)
         pbar = comfy.utils.ProgressBar(steps)
 
-        encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).to(dtype=self.vae_output_dtype())
         samples = comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples += comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples += comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples /= 3.0
+        if not torch.isfinite(samples).all():
+            logging.warning("Tiled VAE encode produced non-finite values, falling back to regular encode")
+            try:
+                samples = encode_fn(pixel_samples).to(self.output_device, copy=True)
+            except Exception as e:
+                model_management.raise_non_oom(e)
+                samples = torch.nan_to_num(samples)
         return samples
 
     def encode_tiled_1d(self, samples, tile_x=256 * 2048, overlap=64 * 2048):
