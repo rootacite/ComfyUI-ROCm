@@ -83,30 +83,77 @@ class ImageUpscaleWithModel(io.ComfyNode):
         in_img = image.movedim(-1,-3).contiguous().to(device)
 
         free_mem = model_management.get_free_memory(device)
-        if free_mem < 5 * 1024 ** 3:
+        amd = model_management.is_amd()
+        if amd:
+            # Default AMD path disables MIOpen, so convs use slow_conv2d im2col.
+            # At native 4x spatial that is ~2.25GiB (tile 256) / ~9GiB (tile 512).
+            if free_mem < 3 * 1024 ** 3:
+                tile = 64
+            elif free_mem < 6 * 1024 ** 3:
+                tile = 128
+            else:
+                tile = 256
+            min_tile = 64
+        elif free_mem < 5 * 1024 ** 3:
             tile = 128
+            min_tile = 128
         elif free_mem < 10 * 1024 ** 3:
             tile = 256
+            min_tile = 128
         else:
             tile = 512
+            min_tile = 128
         overlap = 32
 
         output_device = comfy.model_management.intermediate_device()
+        scale = upscale_model.scale
 
+        def tile_ok(inp, out):
+            if out is None or (not torch.isfinite(out).all()):
+                return False
+            inp_f = inp.float()
+            out_f = out.float()
+            if inp_f.mean() > 0.04 and out_f.mean() < 0.002:
+                return False
+            ref = torch.nn.functional.interpolate(inp_f, size=out_f.shape[-2:], mode="bicubic", align_corners=False).clamp_(0, 1)
+            if (out_f - ref).abs().mean() > 0.15:
+                return False
+            return True
+
+        def upscale_tile(a):
+            x = a.float().contiguous()
+            y = upscale_model(x)
+            if tile_ok(x, y):
+                return y
+            model_management.soft_empty_cache()
+            y = upscale_model(x)
+            if tile_ok(x, y):
+                return y
+            logging.warning("Upscale tile produced invalid output, using bicubic fallback")
+            return torch.nn.functional.interpolate(x, scale_factor=scale, mode="bicubic", align_corners=False).clamp_(0, 1)
+
+        cudnn_prev = torch.backends.cudnn.enabled
+        if amd:
+            torch.backends.cudnn.enabled = True
         oom = True
-        while oom:
-            try:
-                steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(in_img.shape[3], in_img.shape[2], tile_x=tile, tile_y=tile, overlap=overlap)
-                pbar = comfy.utils.ProgressBar(steps)
-                s = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a.float().contiguous()), tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=upscale_model.scale, pbar=pbar, output_device=output_device)
-                oom = False
-            except Exception as e:
-                model_management.raise_non_oom(e)
-                tile //= 2
-                if tile < 128:
-                    raise e
+        try:
+            while oom:
+                try:
+                    steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(in_img.shape[3], in_img.shape[2], tile_x=tile, tile_y=tile, overlap=overlap)
+                    pbar = comfy.utils.ProgressBar(steps)
+                    s = comfy.utils.tiled_scale(in_img, upscale_tile, tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=scale, pbar=pbar, output_device=output_device)
+                    oom = False
+                except Exception as e:
+                    model_management.raise_non_oom(e)
+                    tile //= 2
+                    if tile < min_tile:
+                        raise e
+        finally:
+            torch.backends.cudnn.enabled = cudnn_prev
+            if amd:
+                model_management.soft_empty_cache()
 
-        s = torch.clamp(s.movedim(-3,-1), min=0, max=1.0).to(comfy.model_management.intermediate_dtype())
+        s = torch.clamp(torch.nan_to_num(s.movedim(-3,-1)), min=0, max=1.0).to(comfy.model_management.intermediate_dtype())
 
         if alpha is not None:
             alpha = comfy.utils.common_upscale(alpha.movedim(-1, -3).to(s), s.shape[2], s.shape[1], "bilinear", "disabled")
