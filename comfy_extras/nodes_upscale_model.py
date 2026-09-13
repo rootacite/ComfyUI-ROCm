@@ -80,9 +80,15 @@ class ImageUpscaleWithModel(io.ComfyNode):
         memory_required += image.nelement() * image.element_size()
         model_management.load_models_gpu([upscale_model.patcher], memory_required=memory_required, force_full_load=True)
 
-        in_img = image.movedim(-1,-3).to(device)
+        in_img = image.movedim(-1,-3).contiguous().to(device)
 
-        tile = 512
+        free_mem = model_management.get_free_memory(device)
+        if free_mem < 5 * 1024 ** 3:
+            tile = 128
+        elif free_mem < 10 * 1024 ** 3:
+            tile = 256
+        else:
+            tile = 512
         overlap = 32
 
         output_device = comfy.model_management.intermediate_device()
@@ -92,7 +98,7 @@ class ImageUpscaleWithModel(io.ComfyNode):
             try:
                 steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(in_img.shape[3], in_img.shape[2], tile_x=tile, tile_y=tile, overlap=overlap)
                 pbar = comfy.utils.ProgressBar(steps)
-                s = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a.float()), tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=upscale_model.scale, pbar=pbar, output_device=output_device)
+                s = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a.float().contiguous()), tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=upscale_model.scale, pbar=pbar, output_device=output_device)
                 oom = False
             except Exception as e:
                 model_management.raise_non_oom(e)
