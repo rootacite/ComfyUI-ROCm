@@ -1179,6 +1179,18 @@ class VAE:
             except Exception as e:
                 model_management.raise_non_oom(e)
 
+        # Same skinny-strip NaN on AMD for large latents (e.g. 112x160 / 896x1280).
+        if model_management.is_amd():
+            output = comfy.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount = self.upscale_ratio, output_device=self.output_device)
+            if not torch.isfinite(output).all():
+                logging.warning("Tiled VAE decode produced non-finite values, falling back to regular decode")
+                try:
+                    output = decode_fn(samples).to(self.output_device, copy=True)
+                except Exception as e:
+                    model_management.raise_non_oom(e)
+                    output = torch.nan_to_num(output)
+            return self.process_output(output.to(self.output_device, copy=True))
+
         steps = samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x, tile_y, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x // 2, tile_y * 2, overlap)
         steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
@@ -1227,6 +1239,17 @@ class VAE:
                 return encode_fn(pixel_samples).to(self.output_device, copy=True)
             except Exception as e:
                 model_management.raise_non_oom(e)
+
+        if model_management.is_amd():
+            samples = comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
+            if not torch.isfinite(samples).all():
+                logging.warning("Tiled VAE encode produced non-finite values, falling back to regular encode")
+                try:
+                    samples = encode_fn(pixel_samples).to(self.output_device, copy=True)
+                except Exception as e:
+                    model_management.raise_non_oom(e)
+                    samples = torch.nan_to_num(samples)
+            return samples
 
         steps = pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x, tile_y, overlap)
         steps += pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x // 2, tile_y * 2, overlap)
@@ -1300,7 +1323,10 @@ class VAE:
                 memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
                 with comfy.model_prefetch.pause_malloc_graph():
                     model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-                free_memory = self.patcher.get_free_memory(self.device)
+                # Do not count AIMDO-reclaimable UNet pages as free. VAE conv
+                # workspaces are not AIMDO-tracked; treating those pages as free
+                # lets a full-frame decode land on resident UNet weights.
+                free_memory = model_management.get_free_memory(self.device)
 
                 # A VAE with a reliable estimate skips the doomed untiled attempt.
                 if getattr(self.first_stage_model, "comfy_decode_estimate_is_reliable", False):
@@ -1461,21 +1487,24 @@ class VAE:
             try:
                 memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
                 model_management.load_models_gpu([self.patcher], memory_required=memory_used, force_full_load=self.disable_offload)
-                free_memory = self.patcher.get_free_memory(self.device)
+                free_memory = model_management.get_free_memory(self.device)
                 batch_number = int(free_memory / max(1, memory_used))
-                batch_number = max(1, batch_number)
-                samples = None
-                for x in range(0, pixel_samples.shape[0], batch_number):
-                    pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
-                    if getattr(self.first_stage_model, 'comfy_has_chunked_io', False):
-                        out = self.first_stage_model.encode(pixels_in, device=self.device)
-                    else:
-                        pixels_in = pixels_in.to(self.device)
-                        out = self.first_stage_model.encode(pixels_in)
-                    out = out.to(self.output_device).to(dtype=self.vae_output_dtype())
-                    if samples is None:
-                        samples = torch.empty((pixel_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device, dtype=self.vae_output_dtype())
-                    samples[x:x + batch_number] = out
+                if batch_number < 1:
+                    logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
+                    do_tile = True
+                else:
+                    samples = None
+                    for x in range(0, pixel_samples.shape[0], batch_number):
+                        pixels_in = self.process_input(pixel_samples[x:x + batch_number]).to(self.vae_dtype)
+                        if getattr(self.first_stage_model, 'comfy_has_chunked_io', False):
+                            out = self.first_stage_model.encode(pixels_in, device=self.device)
+                        else:
+                            pixels_in = pixels_in.to(self.device)
+                            out = self.first_stage_model.encode(pixels_in)
+                        out = out.to(self.output_device).to(dtype=self.vae_output_dtype())
+                        if samples is None:
+                            samples = torch.empty((pixel_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device, dtype=self.vae_output_dtype())
+                        samples[x:x + batch_number] = out
 
             except Exception as e:
                 model_management.raise_non_oom(e)
