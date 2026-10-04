@@ -32,4 +32,4 @@ export NUMEXPR_NUM_THREADS=8
 export MIOPEN_FIND_MODE=2
 export MIOPEN_ENABLE_CACHE=1
 
-python main.py --lowvram --preview-method auto --listen 0.0.0.0 --bf16-vae --enable-manager --bf16-unet --use-pytorch-cross-attention --bf16-text-enc --enable-dynamic-vram
+python main.py --lowvram --preview-method auto --listen 0.0.0.0 --bf16-vae --enable-manager --bf16-unet --use-pytorch-cross-attention --bf16-text-enc
